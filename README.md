@@ -11,6 +11,7 @@
 
 ### Leader Election
 **2020-06-08**
+
 2A 测试情况如下：
 ```shell
 Test (2A): initial election ...
@@ -24,6 +25,7 @@ ok      _/mit6.824-golabs/src/raft     9.120s
 
 ### Log Replication
 **2020-06-08**
+
 相比于 `lab2A` 分支稍微做了改进。
 
 `lab2A` 中的 leader 采取统一的频率来向其他 servers 发送心跳（日志条目）。
