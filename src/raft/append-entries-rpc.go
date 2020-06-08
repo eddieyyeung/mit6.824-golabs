@@ -181,10 +181,8 @@ func (rf *Raft) sendAll() {
 							rf.nextIndexes[server] = nextIndex + len(entries)
 							rf.matchIndexes[server] = nextIndex + len(entries) - 1
 							rf.mu.Unlock()
-							time.Sleep(time.Millisecond * 20)
-						} else {
-							time.Sleep(time.Millisecond * 200)
 						}
+						time.Sleep(time.Millisecond * 200)
 					} else {
 						rf.mu.Lock()
 						// ni := 1
