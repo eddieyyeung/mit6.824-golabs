@@ -1,0 +1,12 @@
+sudo go test -run 2A -race | tee out.log
+sudo go test -run TestInitialElection2A -race | tee out.log
+sudo go test -run TestReElection2A -race | tee out.log
+sudo go test -run TestBasicAgree2B -race | tee out.log
+sudo go test -run TestRPCBytes2B -race | tee out.log
+sudo go test -run TestFailAgree2B -race | tee out.log
+sudo go test -run TestFailNoAgree2B -race | tee out.log
+sudo go test -run TestConcurrentStarts2B -race | tee out.log
+sudo go test -run TestRejoin2B -race | tee out.log
+sudo go test -run TestCount2B -race | tee out.log
+sudo go test -run TestBackup2B -race | tee out.log
+sudo go test -run 2B -race | tee out.log

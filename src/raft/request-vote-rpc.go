@@ -1,6 +1,9 @@
 package raft
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 //
 // example RequestVote RPC arguments structure.
@@ -10,8 +13,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int // candidate’s term
 	CandidateID  int // candidate requesting vote
-	LastLogIndex int // index of candidate’s last log entry (§5.4)
-	LastLogTerm  int // term of candidate’s last log entry (§5.4)
+	LastLogIndex int // index of candidate’s last logs entry (§5.4)
+	LastLogTerm  int // term of candidate’s last logs entry (§5.4)
 }
 
 //
@@ -28,28 +31,55 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	DPrintf("[%v][RequestVote]", rf.me)
 	// Your code here (2A, 2B).
-	currentTerm := rf.getCurrentTerm()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	// 1. Reply false if term < currentTerm
-	if args.Term < currentTerm {
-		reply.Term = currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		DPrintf("[%v][RequestVote] a", rf.me)
+		DPrintf("[%v][RequestVote] [1.] [reply:%#v]", rf.me, reply)
 		return
 	}
-	rf.setVotedFor(args.CandidateID)
-	reply.VoteGranted = true
-	reply.Term = args.Term
-	rf.roleWant <- RoleWant{
-		Term: args.Term,
-		Role: Follower,
-	}
-	DPrintf("[%v][RequestVote] b", rf.me)
-	return
 
-	// TODO: 2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
+	// TODO: 2. If votedFor is null or candidateId, and candidate’s logs is at least as up-to-date as receiver’s logs, grant vote
+	if args.LastLogTerm > rf.logs[len(rf.logs)-1].Term ||
+		(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex >= len(rf.logs)-1) {
+		rf.votedFor = args.CandidateID
+		reply.VoteGranted = true
+		reply.Term = args.Term
+		go func() {
+			rf.roleWantCh <- RoleWant{
+				Term: args.Term,
+				Role: Follower,
+			}
+		}()
+		DPrintf("[%v][RequestVote] [2.] [reply:%#v]", rf.me, reply)
+		return
+	}
+
+	// TODO: term T > currentTerm: set currentTerm = T, convert to follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		reply.VoteGranted = false
+		reply.Term = args.Term
+		if rf.role != Follower {
+			rf.votedFor = -1
+			go func() {
+				rf.roleWantCh <- RoleWant{
+					Term: args.Term,
+					Role: Follower,
+				}
+			}()
+		}
+		DPrintf("[%v][RequestVote] [3.] [reply:%#v]", rf.me, reply)
+		return
+	}
+	reply.VoteGranted = false
+	reply.Term = args.Term
+	DPrintf("[%v][RequestVote] [4.] [reply:%#v]", rf.me, reply)
+	return
 }
 
 //
@@ -87,83 +117,62 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAllRequestVote(ch chan RoleWant) {
-	DPrintf("[%v][sendAllRequestVote]", rf.me)
-	rf.setCurrentTerm(rf.getCurrentTerm() + 1)
-	rf.setVotedFor(rf.me)
+	rf.mu.Lock()
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	// roleCh := make(chan Role)
-	voteCount := 1
-	currentTerm := rf.getCurrentTerm()
-	maxTerm := currentTerm
-	go func() {
-		for index := range rf.peers {
-			if index == rf.me {
-				continue
+	DPrintf("[%v][sendAllRequestVote] [Term:%v]", rf.me, rf.currentTerm)
+	rf.votedFor = rf.me
+	currentTerm := rf.currentTerm
+	lastLogIndex := len(rf.logs) - 1
+	lastLogTerm := rf.logs[lastLogIndex].Term
+	rf.mu.Unlock()
+	var voteCount int32 = 1
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(server int) {
+			args := &RequestVoteArgs{
+				Term:         currentTerm,
+				CandidateID:  rf.me,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
 			}
-			wg.Add(1)
-			go func(server int) {
-				args := &RequestVoteArgs{
-					Term:         currentTerm,
-					CandidateID:  rf.me,
-					LastLogIndex: 0,
-					LastLogTerm:  0,
-				}
-				reply := &RequestVoteReply{}
-				ok := rf.sendRequestVote(server, args, reply)
-				DPrintf("[%v][sendAllRequestVote] server:%v args:%v reply:%v", rf.me, server, args, reply)
+			reply := &RequestVoteReply{}
+			ok := rf.sendRequestVote(server, args, reply)
+			DPrintf("[%v][sendAllRequestVote] server:%v args:%#v reply:%#v", rf.me, server, args, reply)
 
-				// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
-
-				mu.Lock()
-				if ok && reply.Term > maxTerm {
-					maxTerm = reply.Term
+			// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+			if ok && reply.Term > currentTerm {
+				go func() {
 					ch <- RoleWant{
 						Term: reply.Term,
 						Role: Follower,
 					}
-				}
-				if reply.VoteGranted {
-					voteCount++
-					if voteCount > len(rf.peers)/2 {
+				}()
+				return
+			}
+
+			if reply.VoteGranted {
+				atomic.AddInt32(&voteCount, 1)
+				if atomic.LoadInt32(&voteCount) > int32(len(rf.peers)/2) {
+					go func() {
 						ch <- RoleWant{
 							Term: currentTerm,
 							Role: Leader,
 						}
-					}
+					}()
+					return
 				}
-				mu.Unlock()
-				wg.Done()
-			}(index)
-		}
-		wg.Wait()
+			}
+			wg.Done()
+		}(index)
+	}
+	wg.Wait()
+	go func() {
 		ch <- RoleWant{
 			Term: currentTerm,
 			Role: Candidate,
 		}
 	}()
-
-	// select {
-	// case role := <-roleCh:
-	// 	DPrintf("[%v][sendAllRequestVote] [roleCh:%v]", rf.me, role)
-	// 	if role == Follower {
-	// 		rf.setCurrentTerm(maxTerm)
-	// 	}
-	// 	ch <- role
-	// 	return
-	// }
-	//
-	// if isFollower {
-	// 	DPrintf("[%v][sendAllRequestVote] isFollower", rf.me)
-	// 	rf.setCurrentTerm(maxTerm)
-	// 	ch <- Follower
-	// 	return
-	// }
-	// if voteCount > len(rf.peers)/2 {
-	// 	DPrintf("[%v][sendAllRequestVote] to beLeader", rf.me)
-	// 	ch <- Leader
-	// 	return
-	// }
-	// DPrintf("[%v][sendAllRequestVote] to beCandidate", rf.me)
-	// ch <- Candidate
 }

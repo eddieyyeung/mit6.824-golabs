@@ -8,11 +8,11 @@ package raft
 // rf = Make(...)
 //   create a new Raft server.
 // rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
+//   start agreement on a new logs entry
 // rf.GetState() (term, isLeader)
 //   ask a Raft for its current term, and whether it thinks it is leader
 // ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
+//   each time a new entry is committed to the logs, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
 //
@@ -28,11 +28,11 @@ import "../labrpc"
 // import "../labgob"
 
 //
-// as each Raft peer becomes aware that successive log entries are
+// as each Raft peer becomes aware that successive logs entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
 // CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
+// committed logs entry.
 //
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
@@ -52,6 +52,11 @@ const (
 	Leader         = "Leader"
 )
 
+type RoleWant struct {
+	Term int
+	Role Role
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -62,8 +67,12 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	role     Role
-	roleWant chan RoleWant
+	role       Role
+	roleWantCh chan RoleWant
+
+	applyMsgCh chan ApplyMsg
+
+	quitCh chan struct{}
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -71,27 +80,29 @@ type Raft struct {
 	// Persistent state on all servers: (Updated on stable storage before responding to RPCs)
 	currentTerm int   // latest term server has seen (initialized to 0 on first boot, increases monotonically[单调递增])
 	votedFor    int   // candidateId that received vote in current term (or null if none)
-	log         []Log // log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+	logs        []Log // logs entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
 
 	// Volatile state on all servers:
-	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically[单调递增])
-	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically[单调递增])
+	commitIndex int // index of highest logs entry known to be committed (initialized to 0, increases monotonically[单调递增])
+	lastApplied int // index of highest logs entry applied to state machine (initialized to 0, increases monotonically[单调递增])
 
 	// Volatile state on leaders: (Reinitialized after election)
-	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically[单调递增])
+	nextIndexes  []int // for each server, index of the next logs entry to send to that server (initialized to leader last logs index + 1)
+	matchIndexes []int // for each server, index of highest logs entry known to be replicated on server (initialized to 0, increases monotonically[单调递增])
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	if rf.getRole() == Leader {
+	if rf.role == Leader {
 		isleader = true
 	}
-	term = rf.getCurrentTerm()
+	term = rf.currentTerm
 	return term, isleader
 }
 
@@ -157,6 +168,12 @@ func (rf *Raft) getCurrentTerm() int {
 	return rf.currentTerm
 }
 
+func (rf *Raft) incrCurrentTerm() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm++
+}
+
 func (rf *Raft) getVotedFor() int {
 	rf.mu.Lock()
 	rf.mu.Unlock()
@@ -169,103 +186,175 @@ func (rf *Raft) setVotedFor(votedFor int) {
 	rf.votedFor = votedFor
 }
 
+func (rf *Raft) getLogs() []Log {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.logs
+}
+
+func (rf *Raft) setLogs(logs []Log) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logs = logs
+}
+
+func (rf *Raft) changeRole(rw RoleWant) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rw.Term < rf.currentTerm {
+		return false
+	}
+	if rw.Term > rf.currentTerm {
+		rf.currentTerm = rw.Term
+	}
+	if rw.Role != rf.role {
+		rf.role = rw.Role
+		return true
+	}
+	return false
+}
+
 func (rf *Raft) beFollower() {
-	DPrintf("[%v][beFollower]", rf.me)
-	rf.setRole(Follower)
+	DPrintf("[%v][beFollower] [term:%v]", rf.me, rf.getCurrentTerm())
 	for {
+		if rf.getRole() != Follower {
+			return
+		}
+		DPrintf("[%v][beFollower+] [term:%v]", rf.me, rf.getCurrentTerm())
 		to := getTimeoutByType(AppendEntriesTimeout)
 		select {
+		case <-rf.quitCh:
+			DPrintf("[%v][beFollower] [quitCh]", rf.me)
+			return
 		case <-to:
 			DPrintf("[%v][beFollower] timeout beCandidate", rf.me)
 			rf.setRole(Candidate)
 			return
-		case rw := <-rf.roleWant:
-			DPrintf("[%v][beFollower-roleWant] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
-			if rw.Term > rf.getCurrentTerm() {
-				rf.setCurrentTerm(rw.Term)
-			}
-			if rw.Role != Follower {
-				rf.setRole(rw.Role)
+		case rw := <-rf.roleWantCh:
+			DPrintf("[%v][beFollower-roleWantCh] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
+			if ok := rf.changeRole(rw); ok {
 				return
 			}
-		}
-	}
-}
-
-func (rf *Raft) beLeader() {
-	DPrintf("[%v][beLeader]", rf.me)
-	rf.role = Leader
-	for i := range rf.peers {
-		rf.nextIndex[i] = len(rf.log)
-		rf.matchIndex[i] = 0
-	}
-
-	for {
-		ch := make(chan RoleWant)
-		go rf.sendAllAppendEntries(ch)
-		select {
-		case rw := <-rf.roleWant:
-			DPrintf("[%v][beLeader-roleWant] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
-			if rw.Term > rf.getCurrentTerm() {
-				rf.setCurrentTerm(rw.Term)
-			}
-			if rw.Role != Leader {
-				rf.setRole(rw.Role)
-				return
-			}
-		case rw := <-ch:
-			DPrintf("[%v][beLeader] rw:%v", rf.me, rw)
-			if rw.Role != Leader {
-				if rw.Term > rf.getCurrentTerm() {
-					rf.setCurrentTerm(rw.Term)
-				}
-				rf.setRole(rw.Role)
-				return
-			}
-			time.Sleep(200 * time.Millisecond)
 		}
 	}
 }
 
 func (rf *Raft) beCandidate() {
-	DPrintf("[%v][beCandidate]", rf.me)
-	rf.role = Candidate
+	DPrintf("[%v][beCandidate] [term:%v]", rf.me, rf.getCurrentTerm())
 	for {
+		if rf.getRole() != Candidate {
+			return
+		}
+		rf.incrCurrentTerm()
+		DPrintf("[%v][beCandidate+] [term:%v]", rf.me, rf.getCurrentTerm())
 		to := getTimeoutByType(ElectionTimeout)
 		ch := make(chan RoleWant)
 		go rf.sendAllRequestVote(ch)
 		select {
+		case <-rf.quitCh:
+			DPrintf("[%v][beCandidate] [quitCh]", rf.me)
+			return
 		case <-to:
 			DPrintf("[%v][beCandidate] timeout", rf.me)
-			continue
-		case rw := <-rf.roleWant:
-			DPrintf("[%v][beCandidate-roleWant] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
-			if rw.Term > rf.getCurrentTerm() {
-				rf.setCurrentTerm(rw.Term)
-			}
-			if rw.Role != Candidate {
-				rf.setRole(rw.Role)
+			rf.setRole(Candidate)
+		case rw := <-rf.roleWantCh:
+			DPrintf("[%v][beCandidate-roleWantCh] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
+			if ok := rf.changeRole(rw); ok {
 				return
 			}
+			time.Sleep(time.Millisecond * 200)
 		case rw := <-ch:
-			DPrintf("[%v][beCandidate] endElection:%v", rf.me, rw)
-			if rw.Role != Candidate {
-				if rw.Term > rf.getCurrentTerm() {
-					rf.setCurrentTerm(rw.Term)
-				}
-				rf.setRole(rw.Role)
+			DPrintf("[%v][beCandidate-ch] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
+			if ok := rf.changeRole(rw); ok {
 				return
+			}
+			time.Sleep(time.Millisecond * 200)
+		}
+	}
+}
+
+func (rf *Raft) beLeader() {
+	DPrintf("[%v][beLeader] [term:%v]", rf.me, rf.getCurrentTerm())
+	rf.mu.Lock()
+	for i := range rf.peers {
+		rf.nextIndexes[i] = len(rf.logs)
+		rf.matchIndexes[i] = 0
+	}
+	rf.mu.Unlock()
+	// ch := make(chan RoleWant)
+	// var majority int32 = 1
+	go rf.sendAll()
+	go rf.checkCommitIndex()
+	select {
+	case <-rf.quitCh:
+		DPrintf("[%v][beLeader] [quitCh]", rf.me)
+		return
+	case rw := <-rf.roleWantCh:
+		DPrintf("[%v][beLeader-roleWantCh] [rf.getCurrentTerm():%v] [rw:%v]", rf.me, rf.getCurrentTerm(), rw)
+		if ok := rf.changeRole(rw); ok {
+			return
+		}
+	}
+}
+
+func (rf *Raft) checkCommitIndex() {
+	for {
+		if rf.getRole() != Leader {
+			return
+		}
+		rf.mu.Lock()
+		DPrintf("[%v][checkCommitIndex] [nextIndexes:%v]", rf.me, rf.nextIndexes)
+		DPrintf("[%v][checkCommitIndex] [matchIndexes:%v]", rf.me, rf.matchIndexes)
+		// If there exists an N such that N > commitIndex, a majority
+		// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+		// set commitIndex = N (§5.3, §5.4)
+	Outer:
+		for n := len(rf.logs) - 1; n >= rf.commitIndex+1; n-- {
+			commitCount := 1
+			for mi := range rf.matchIndexes {
+				if mi == rf.me {
+					continue
+				}
+				if rf.matchIndexes[mi] >= n && rf.logs[n].Term == rf.currentTerm {
+					commitCount++
+					if commitCount > len(rf.peers)/2 {
+						rf.commitIndex = n
+						if rf.commitIndex > rf.lastApplied {
+							preLastApplied := rf.lastApplied
+							commitIndex := rf.commitIndex
+							rf.lastApplied = rf.commitIndex
+							DPrintf("[%v][sendAllAppendEntries][preLastApplied:%v]", rf.me, preLastApplied)
+							go func() {
+								for i := preLastApplied + 1; i <= commitIndex; i++ {
+									rf.mu.Lock()
+									applyMsg := ApplyMsg{
+										CommandValid: true,
+										Command:      rf.logs[i].Command,
+										CommandIndex: i,
+									}
+									rf.mu.Unlock()
+									rf.applyMsgCh <- applyMsg
+									DPrintf("[%v][sendApplyMsg] [applymsg:%v]", rf.me, applyMsg)
+
+								}
+							}()
+						}
+						break Outer
+					}
+				}
 			}
 		}
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 100)
 	}
 }
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
+// agreement on the next command to be appended to Raft's logs. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
+// command will ever be committed to the Raft logs, since the leader
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
@@ -275,11 +364,25 @@ func (rf *Raft) beCandidate() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
 	term := -1
 	isLeader := true
-
 	// Your code here (2B).
+	if rf.role != Leader {
+		isLeader = false
+	} else {
+		index = len(rf.logs)
+		term = rf.currentTerm
+		rf.logs = append(rf.logs, Log{
+			Command: command,
+			Term:    term,
+			Index:   index,
+		})
+	}
+
+	DPrintf("[%v][Start] [command:%v] [logs:%v]", rf.me, command, rf.logs)
 
 	return index, term, isLeader
 }
@@ -298,6 +401,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.quitCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -305,9 +409,24 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-type RoleWant struct {
-	Term int
-	Role Role
+func (rf *Raft) Run() {
+	go func() {
+		for {
+			select {
+			case <-rf.quitCh:
+				return
+			default:
+				switch rf.getRole() {
+				case Candidate:
+					rf.beCandidate()
+				case Follower:
+					rf.beFollower()
+				case Leader:
+					rf.beLeader()
+				}
+			}
+		}
+	}()
 }
 
 //
@@ -326,24 +445,23 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.role = Follower
-	rf.roleWant = make(chan RoleWant)
-	go func() {
-		for {
-			switch rf.getRole() {
-			case Candidate:
-				rf.beCandidate()
-			case Follower:
-				rf.beFollower()
-			case Leader:
-				rf.beLeader()
-			}
-		}
-	}()
+	rf.applyMsgCh = applyCh
+	rf.roleWantCh = make(chan RoleWant)
+	rf.nextIndexes = make([]int, len(rf.peers))
+	rf.matchIndexes = make([]int, len(rf.peers))
+	rf.setVotedFor(-1)
+	rf.logs = []Log{{
+		Command: nil,
+		Term:    -1,
+		Index:   0,
+	}}
+	rf.setCurrentTerm(0)
+	rf.quitCh = make(chan struct{})
+	rf.Run()
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
